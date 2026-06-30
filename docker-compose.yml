@@ -1,0 +1,87 @@
+version: '3.8'
+
+services:
+  # ==========================================
+  # [1] 最外層守衛：Nginx
+  # ==========================================
+  gitlab-nginx:
+    build: ./nginx
+    ports:
+      - "80:80"
+    networks:
+      - gitlab_network
+    depends_on:
+      - gitlab-workhorse  # 🔓 解除封印！現在它知道要等 Workhorse 先起來了
+
+  # ==========================================
+  # [2] 苦力馬：Workhorse (新增！)
+  # ==========================================
+  gitlab-workhorse:
+    image: registry.gitlab.com/gitlab-org/build/cng/gitlab-workhorse-ce:latest
+    environment:
+      # 告訴 Workhorse：「大腦 Puma 在哪裡？」
+      - GITLAB_WEBSERVICE_HOST=gitlab-webservice
+      - GITLAB_WEBSERVICE_PORT=8080
+    volumes:
+      # Workhorse 需要一個暫存區來放你上傳的大檔案
+      - ./data/shared:/shared
+    networks:
+      - gitlab_network
+    depends_on:
+      - gitlab-webservice # Workhorse 必須等大腦先啟動
+
+  # ==========================================
+  # [3] 系統大腦：Puma / Webservice (新增！)
+  # ==========================================
+  gitlab-webservice:
+    image: registry.gitlab.com/gitlab-org/build/cng/gitlab-webservice-ce:latest
+    environment:
+      # ⚠️ 這是最關鍵的地方！大腦必須知道所有基礎設施的密碼！
+      - DB_ADAPTER=postgresql1
+      - DB_HOST=gitlab-postgres
+      - DB_USER=gitlab
+      - DB_PASSWORD=gitlab_db_secret
+      - DB_DATABASE=gitlabhq_production
+      #
+      - REDIS_HOST=gitlab-redis
+      - REDIS_PASSWORD=gitlab_redis_secret
+      #
+      - GITALY_ADDRESS=tcp://gitlab-gitaly:8075
+      - GITALY_TOKEN=gitaly_secret_token
+    volumes:
+      # Puma 也需要掛載 shared 資料夾，用來跟 Workhorse 交換暫存檔
+      - ./data/shared:/shared
+    networks:
+      - gitlab_network
+    depends_on:
+      - gitlab-postgres
+      - gitlab-redis
+      - gitlab-gitaly
+
+  # ==========================================
+  # [4] 底層儲存與快取 (維持原樣)
+  # ==========================================
+  gitlab-gitaly:
+    image: registry.gitlab.com/gitlab-org/build/cng/gitaly:latest
+    environment:
+      - GITALY_TOKEN=gitaly_secret_token
+    volumes:
+      - ./data/git-data:/var/opt/gitlab/git-data
+    networks:
+      - gitlab_network
+
+  gitlab-redis:
+    build: ./redis
+    networks:
+      - gitlab_network
+
+  gitlab-postgres:
+    build: ./postgres
+    volumes:
+      - ./data/postgresql:/var/lib/postgresql/14/main
+    networks:
+      - gitlab_network
+
+networks:
+  gitlab_network:
+    driver: bridge
