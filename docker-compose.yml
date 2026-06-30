@@ -1,87 +1,108 @@
-version: '3.8'
+# compose v2 不再需要 version: 欄位
 
 services:
   # ==========================================
-  # [1] 最外層守衛：Nginx
+  # [1] 唯一的 Nginx：你手搓的，直接打 omnibus 裡的 Workhorse
   # ==========================================
   gitlab-nginx:
     build: ./nginx
     ports:
       - "80:80"
-    networks:
-      - gitlab_network
     depends_on:
-      - gitlab-workhorse  # 🔓 解除封印！現在它知道要等 Workhorse 先起來了
-
-  # ==========================================
-  # [2] 苦力馬：Workhorse (新增！)
-  # ==========================================
-  gitlab-workhorse:
-    image: registry.gitlab.com/gitlab-org/build/cng/gitlab-workhorse-ce:latest
-    environment:
-      # 告訴 Workhorse：「大腦 Puma 在哪裡？」
-      - GITLAB_WEBSERVICE_HOST=gitlab-webservice
-      - GITLAB_WEBSERVICE_PORT=8080
-    volumes:
-      # Workhorse 需要一個暫存區來放你上傳的大檔案
-      - ./data/shared:/shared
+      gitlab-app:
+        condition: service_healthy
     networks:
       - gitlab_network
+    restart: unless-stopped
+
+  # ==========================================
+  # [2] 應用層：omnibus（關掉內建 nginx，Workhorse 改聽 TCP 8181）
+  # ==========================================
+  gitlab-app:
+    image: gitlab/gitlab-ce:17.11.0-ce.0   # ★ 改成你要的當前版本，務必釘版本
+    hostname: gitlab.local
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        # ★ 改成你瀏覽器實際輸入的網址（例如 http://192.168.x.x）
+        external_url 'http://localhost'
+
+        # --- 關閉內建 PostgreSQL，改連你手搓的 postgres 容器 ---
+        postgresql['enable'] = false
+        gitlab_rails['db_adapter']  = 'postgresql'
+        gitlab_rails['db_host']     = 'gitlab-postgres'
+        gitlab_rails['db_port']     = 5432
+        gitlab_rails['db_username'] = 'gitlab'
+        gitlab_rails['db_password'] = 'gitlab_db_secret'
+        gitlab_rails['db_database'] = 'gitlabhq_production'
+
+        # --- 關閉內建 Redis，改連你手搓的 redis 容器 ---
+        redis['enable'] = false
+        gitlab_rails['redis_host']     = 'gitlab-redis'
+        gitlab_rails['redis_port']     = 6379
+        gitlab_rails['redis_password'] = 'gitlab_redis_secret'
+
+        # --- 關掉內建 Nginx，讓 Workhorse 改聽 TCP，給外部的你那顆 nginx 連 ---
+        nginx['enable'] = false
+        gitlab_workhorse['listen_network'] = "tcp"
+        gitlab_workhorse['listen_addr']    = "0.0.0.0:8181"
+
+        # --- 8GB 機器的記憶體瘦身 ---
+        puma['worker_processes'] = 2
+        sidekiq['max_concurrency'] = 9
+        prometheus_monitoring['enable'] = false
+    volumes:
+      - ./data/app/config:/etc/gitlab
+      - ./data/app/logs:/var/log/gitlab
+      - ./data/app/data:/var/opt/gitlab
+    shm_size: '256m'
     depends_on:
-      - gitlab-webservice # Workhorse 必須等大腦先啟動
-
-  # ==========================================
-  # [3] 系統大腦：Puma / Webservice (新增！)
-  # ==========================================
-  gitlab-webservice:
-    image: registry.gitlab.com/gitlab-org/build/cng/gitlab-webservice-ce:latest
-    environment:
-      # ⚠️ 這是最關鍵的地方！大腦必須知道所有基礎設施的密碼！
-      - DB_ADAPTER=postgresql1
-      - DB_HOST=gitlab-postgres
-      - DB_USER=gitlab
-      - DB_PASSWORD=gitlab_db_secret
-      - DB_DATABASE=gitlabhq_production
-      #
-      - REDIS_HOST=gitlab-redis
-      - REDIS_PASSWORD=gitlab_redis_secret
-      #
-      - GITALY_ADDRESS=tcp://gitlab-gitaly:8075
-      - GITALY_TOKEN=gitaly_secret_token
-    volumes:
-      # Puma 也需要掛載 shared 資料夾，用來跟 Workhorse 交換暫存檔
-      - ./data/shared:/shared
+      gitlab-postgres:
+        condition: service_healthy
+      gitlab-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "gitlab-ctl status >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 15s
+      retries: 30
+      start_period: 600s
     networks:
       - gitlab_network
-    depends_on:
-      - gitlab-postgres
-      - gitlab-redis
-      - gitlab-gitaly
+    restart: unless-stopped
 
   # ==========================================
-  # [4] 底層儲存與快取 (維持原樣)
+  # [3] 你手搓的 PostgreSQL（named volume）
   # ==========================================
-  gitlab-gitaly:
-    image: registry.gitlab.com/gitlab-org/build/cng/gitaly:latest
-    environment:
-      - GITALY_TOKEN=gitaly_secret_token
-    volumes:
-      - ./data/git-data:/var/opt/gitlab/git-data
-    networks:
-      - gitlab_network
-
-  gitlab-redis:
-    build: ./redis
-    networks:
-      - gitlab_network
-
   gitlab-postgres:
     build: ./postgres
     volumes:
-      - ./data/postgresql:/var/lib/postgresql/14/main
+      - pg_data:/var/lib/postgresql/14/main
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gitlab -d gitlabhq_production"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
     networks:
       - gitlab_network
+    restart: unless-stopped
+
+  # ==========================================
+  # [4] 你手搓的 Redis
+  # ==========================================
+  gitlab-redis:
+    build: ./redis
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a gitlab_redis_secret ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - gitlab_network
+    restart: unless-stopped
 
 networks:
   gitlab_network:
     driver: bridge
+
+volumes:
+  pg_data:
